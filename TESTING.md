@@ -109,6 +109,26 @@ Then repeat armed:
 time sudo ./lru-isolate arm -- systemctl set-property test.slice AllowedMemoryNodes=0
 ```
 
+Note what `time` measures here. `arm` does **not** return when `systemctl`
+returns: the migration runs asynchronously on `cpuset_migrate_mm_wq` after the
+write, so `arm` keeps draining until that workqueue has been idle for 2 s. The
+elapsed time is therefore roughly *migration duration + 2 s*, and that is the
+number you want — it is how long the stall would have had to be covered for.
+The thing to compare against the unarmed run is PID 1's state, not the
+wall clock.
+
+Add `-v` to see the drain-pass count and confirm it kept draining across the
+whole migration rather than exiting early:
+
+```bash
+sudo ./lru-isolate arm -v -- systemctl set-property test.slice AllowedMemoryNodes=0
+# ... armed: 4127 drain passes over 41.3 s (interval 10 ms)
+```
+
+If it prints `warning: cpuset_migrate_mm_wq still busy at the --settle cap`,
+the migration outlived the drain window — raise `--settle` or run `guard`
+alongside.
+
 Compare against the 2×2 above. If row 2 still stalls, that is expected and
 correct — it is cause 1, and it needs the reboot.
 

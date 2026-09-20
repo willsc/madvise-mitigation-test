@@ -17,6 +17,27 @@
  * is saturated by a SCHED_FIFO busy-poll thread the per-CPU kworker never
  * runs, so flush_work() blocks - and PID 1 sits in D state.
  *
+ * THE WRITE IS NOT WHERE THE MIGRATION HAPPENS
+ * --------------------------------------------
+ * do_migrate_pages() does NOT run in the context of the cpuset.mems write.
+ * update_tasks_nodemask() walks the cpuset and calls cpuset_migrate_mm() once
+ * per task; each call queues a work item and the write returns immediately:
+ *
+ *     kernel/cgroup/cpuset.c:2641  while ((task = css_task_iter_next(&it)))
+ *     kernel/cgroup/cpuset.c:2556      queue_work(cpuset_migrate_mm_wq, ...)
+ *     kernel/cgroup/cpuset.c:4010  alloc_ordered_workqueue("cpuset_migrate_mm", 0)
+ *
+ * That workqueue is *ordered* - max_active=1 - so N tasks in the cpuset means
+ * N lru_cache_disable() calls run strictly serially on an unbound kworker,
+ * for as long as the migration takes (the bug reports 60 s - 10 min).  Each
+ * one re-reads cpu_needs_drain() for every CPU.
+ *
+ * So a drain that happens once, before the write, covers none of them.  `arm'
+ * therefore forks the command and keeps draining until the migration has
+ * actually drained out - see cmd_arm().  An earlier version drained once and
+ * exec()ed, which tore the drain threads down before the first work item had
+ * even been picked up.
+ *
  * Verified against linux-aws 7.0 (mm/swap.c):
  *
  *     for_each_online_cpu(cpu) {
@@ -96,6 +117,7 @@
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -107,6 +129,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -649,16 +672,77 @@ static void bh_flush(const char *dev)
 	close(fd);
 }
 
+/*
+ * Is a cpuset memory migration still running?
+ *
+ * cpuset_migrate_mm_wq is unbound, so only a kworker/u* can be running
+ * cpuset_migrate_mm_workfn().  Checking comm before reading the stack keeps
+ * this from unwinding every kthread on a 192-CPU box.
+ *
+ * Returns 1 = in flight, 0 = idle, -1 = cannot tell (no CONFIG_STACKTRACE,
+ * or not privileged enough to read /proc/<pid>/stack).
+ */
+static int migration_in_flight(void)
+{
+	DIR *proc = opendir("/proc");
+	struct dirent *pe;
+	int readable = 0, found = 0;
+
+	if (!proc)
+		return -1;
+
+	while ((pe = readdir(proc))) {
+		char path[320], buf[8192];
+		int fd, n;
+
+		if (!isdigit((unsigned char)pe->d_name[0]))
+			continue;
+
+		snprintf(path, sizeof(path), "/proc/%s/comm", pe->d_name);
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		n = (int)read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = 0;
+		if (strncmp(buf, "kworker/u", 9) != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "/proc/%s/stack", pe->d_name);
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		n = (int)read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = 0;
+		readable = 1;
+		if (strstr(buf, "cpuset_migrate_mm_workfn")) {
+			found = 1;
+			break;
+		}
+	}
+	closedir(proc);
+
+	if (found)
+		return 1;
+	return readable ? 0 : -1;
+}
+
 struct opts {
 	char *mask;
 	int rtprio;		/* >0 fixed, 0 none, -1 auto */
 	int serial;
 	int json;
 	int interval_ms;
+	int settle_ms;		/* arm: cap on draining after the command exits */
 	const char *bhdev;
 };
 
-static int drain_pass(struct opts *o)
+static int drain_pass(struct opts *o, int report)
 {
 	struct timespec p0, p1;
 	double worst_sched = 0, total = 0;
@@ -716,6 +800,9 @@ static int drain_pass(struct opts *o)
 		total += d->drain_us;
 	}
 
+	if (!report)
+		return failed ? 1 : 0;
+
 	if (o->json) {
 		printf("{\"cpus\":%d,\"failed\":%d,\"rt_denied\":%d,"
 		       "\"pass_us\":%.1f,\"worst_sched_us\":%.1f,\"drains\":[",
@@ -750,6 +837,149 @@ static int drain_pass(struct opts *o)
 			}
 	}
 	return failed ? 1 : 0;
+}
+
+/* ----------------------------------------------------------------------- arm */
+
+#define ARM_QUIET_MS	2000	/* idle this long => the migration is done */
+#define ARM_POLL_MS	100	/* how often to look for the migration worker */
+
+static volatile sig_atomic_t g_fwd_sig;
+
+static void arm_sighandler(int s)
+{
+	g_fwd_sig = s;
+}
+
+/*
+ * Drain, run the command, and keep draining until the migration it kicks off
+ * has actually finished.
+ *
+ * The window that matters is not "drain -> write".  It is "drain -> every
+ * cpu_needs_drain() read made by every queued cpuset_migrate_mm work item",
+ * and those run on an unbound kworker after the write has already returned.
+ * See "THE WRITE IS NOT WHERE THE MIGRATION HAPPENS" at the top of this file.
+ */
+static int cmd_arm(struct opts *o, char **argv, int execpos)
+{
+	struct timespec ts, t_start, t_exit, t_quiet, t_poll = { 0, 0 }, now;
+	struct sigaction sa;
+	unsigned long passes = 0;
+	pid_t pid;
+	int status = 0, child_done = 0, rc;
+	int undetectable = 0, capped = 0, inflight = 0;
+
+	if (drainers_start(o->mask, o->rtprio) != 0)
+		return 1;
+
+	/* one drain before the write, as before */
+	rc = drain_pass(o, 1);
+	if (rc > 1) {
+		drainers_stop();
+		return rc;
+	}
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = arm_sighandler;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+	t_exit = t_quiet = t_start;
+
+	pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		drainers_stop();
+		return 1;
+	}
+	if (pid == 0) {
+		/* between fork() and exec() only async-signal-safe calls */
+		execvp(argv[execpos], &argv[execpos]);
+		perror("execvp");
+		_exit(127);
+	}
+
+	ts.tv_sec = o->interval_ms / 1000;
+	ts.tv_nsec = (long)(o->interval_ms % 1000) * 1000000L;
+
+	for (;;) {
+		drain_pass(o, 0);
+		passes++;
+
+		if (g_fwd_sig) {
+			int sig = g_fwd_sig;
+
+			g_fwd_sig = 0;
+			kill(pid, sig);
+		}
+
+		if (!child_done && waitpid(pid, &status, WNOHANG) == pid) {
+			child_done = 1;
+			clock_gettime(CLOCK_MONOTONIC, &t_exit);
+			t_quiet = t_exit;
+			vrb("command exited; draining until cpuset_migrate_mm_wq settles\n");
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+
+		if (delta_us(t_poll, now) / 1000.0 >= ARM_POLL_MS) {
+			t_poll = now;
+			inflight = migration_in_flight();
+			if (inflight > 0)
+				t_quiet = now;
+			else if (inflight < 0)
+				undetectable = 1;
+		}
+
+		if (child_done) {
+			double since_exit = delta_us(t_exit, now) / 1000.0;
+			double quiet = delta_us(t_quiet, now) / 1000.0;
+
+			if (o->settle_ms > 0 && since_exit >= o->settle_ms) {
+				capped = 1;
+				break;
+			}
+			/*
+			 * Without readable kworker stacks there is no signal
+			 * to stop on, so drain the whole settle window rather
+			 * than guess that the migration is over.
+			 */
+			if (!undetectable && quiet >= ARM_QUIET_MS)
+				break;
+			if (undetectable && o->settle_ms <= 0)
+				break;
+		}
+
+		nanosleep(&ts, NULL);
+	}
+
+	if (!child_done)
+		waitpid(pid, &status, 0);
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	drainers_stop();
+
+	if (!o->json)
+		printf("armed: %lu drain passes over %.1f s (interval %d ms)\n",
+		       passes, delta_us(t_start, now) / 1e6, o->interval_ms);
+	if (undetectable)
+		fprintf(stderr,
+			"note: cannot read kworker stacks (need root and "
+			"CONFIG_STACKTRACE); drained for the full --settle "
+			"window instead of watching for the migration.\n");
+	if (capped && inflight > 0)
+		fprintf(stderr,
+			"warning: cpuset_migrate_mm_wq still busy at the "
+			"--settle cap of %d ms - the migration outlived the "
+			"drain. Raise --settle or run `lru-isolate guard'.\n",
+			o->settle_ms);
+
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return 0;
 }
 
 /* --------------------------------------------------------------------- check */
@@ -876,7 +1106,8 @@ static void usage(void)
 "  check                 report exposure to both causes and what is missing\n"
 "  drain                 one drain pass over the target CPUs\n"
 "  guard                 drain every --interval ms until killed\n"
-"  arm -- <cmd...>       drain, then exec <cmd> (use for the cpuset write)\n"
+"  arm -- <cmd...>       run <cmd> while draining continuously, and keep\n"
+"                        draining until the migration it triggers finishes\n"
 "\n"
 "options:\n"
 "  -c, --cpus LIST       target CPUs (default: nohz_full + isolated)\n"
@@ -885,13 +1116,24 @@ static void usage(void)
 "                        'auto' (default) picks the highest userspace RT\n"
 "                        priority seen on each target CPU + 1, so it can\n"
 "                        preempt the busy-poll thread.\n"
-"  -i, --interval MS     guard interval (default 1000)\n"
+"  -i, --interval MS     drain interval: guard default 1000, arm default 10\n"
+"      --settle MS       arm: cap on how long to keep draining after the\n"
+"                        command exits (default 300000, 0 = no cap). arm\n"
+"                        normally stops ~2 s after cpuset_migrate_mm_wq\n"
+"                        goes idle; this is only the backstop.\n"
 "      --serial          drain one CPU at a time instead of all at once\n"
 "      --bh-flush DEV    also invalidate the buffer-head LRU via BLKFLSBUF\n"
 "                        on DEV (IPI-based; clears the one cpu_needs_drain()\n"
 "                        term madvise cannot reach). Drops DEV's page cache.\n"
 "  -j, --json            machine-readable output\n"
 "  -v, --verbose         per-CPU detail\n"
+"\n"
+"why arm does not just exec:\n"
+"  A cpuset.mems write does not migrate anything itself. It queues one work\n"
+"  item per task in the cpuset onto cpuset_migrate_mm_wq - an ordered, unbound\n"
+"  workqueue - and returns. Those items call lru_cache_disable() serially, on\n"
+"  a kworker/u*, long after your command has exited. Draining once and exec()ing\n"
+"  tears the drain threads down before the first one is picked up.\n"
 "\n"
 "isolated cores:\n"
 "  Drain threads are created once and parked on a futex, so a pass costs two\n"
@@ -909,10 +1151,14 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-	struct opts o = { .rtprio = -1, .interval_ms = 1000 };
+	struct opts o = { .rtprio = -1, .interval_ms = 1000, .settle_ms = 300000 };
 	const char *cmd;
 	char why[256];
-	int explicit_cpus = 0, execpos = 0, rc;
+	int explicit_cpus = 0, explicit_interval = 0, execpos = 0, rc;
+
+	/* guard runs as a systemd unit writing to the journal, where a
+	 * block-buffered stdout emits nothing until 4K has piled up. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	g_ncpu = (int)sysconf(_SC_NPROCESSORS_CONF);
 	if (g_ncpu < 1)
@@ -924,6 +1170,10 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	cmd = argv[1];
+	if (!strcmp(cmd, "-h") || !strcmp(cmd, "--help")) {
+		usage();
+		return 0;
+	}
 
 	o.mask = calloc((size_t)g_ncpu, 1);
 	if (!o.mask) {
@@ -954,6 +1204,9 @@ int main(int argc, char **argv)
 		} else if ((!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interval")) &&
 			   i + 1 < argc) {
 			o.interval_ms = atoi(argv[++i]);
+			explicit_interval = 1;
+		} else if (!strcmp(argv[i], "--settle") && i + 1 < argc) {
+			o.settle_ms = atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "--serial")) {
 			o.serial = 1;
 		} else if (!strcmp(argv[i], "--bh-flush") && i + 1 < argc) {
@@ -983,7 +1236,7 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "drain")) {
 		if (drainers_start(o.mask, o.rtprio) != 0)
 			return 1;
-		rc = drain_pass(&o);
+		rc = drain_pass(&o, 1);
 		drainers_stop();
 		return rc;
 	}
@@ -997,7 +1250,7 @@ int main(int argc, char **argv)
 		if (drainers_start(o.mask, o.rtprio) != 0)
 			return 1;
 		for (;;) {
-			drain_pass(&o);
+			drain_pass(&o, 1);
 			nanosleep(&ts, NULL);
 		}
 	}
@@ -1007,21 +1260,14 @@ int main(int argc, char **argv)
 			fprintf(stderr, "arm needs: -- <command...>\n");
 			return 2;
 		}
-		if (drainers_start(o.mask, o.rtprio) != 0)
-			return 1;
-		rc = drain_pass(&o);
-		if (rc > 1) {
-			drainers_stop();
-			return rc;
-		}
 		/*
-		 * Deliberately do NOT stop the drainers first: joining them
-		 * would widen the window between the last drain and the cpuset
-		 * write.  exec() tears them down for us.
+		 * The migration runs asynchronously and serially after the
+		 * write returns, so arm drains continuously rather than once.
+		 * A 1 s guard interval would leave most of that uncovered.
 		 */
-		execvp(argv[execpos], &argv[execpos]);
-		perror("execvp");
-		return 127;
+		if (!explicit_interval)
+			o.interval_ms = 10;
+		return cmd_arm(&o, argv, execpos);
 	}
 
 	usage();

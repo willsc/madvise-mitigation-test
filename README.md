@@ -26,6 +26,35 @@ cpuset_migrate_mm()
             └─ __lru_add_drain_all(true)        ← cause 2
 ```
 
+### The write is not where the migration happens
+
+`do_migrate_pages()` does not run in the context of the `cpuset.mems` write.
+`update_tasks_nodemask()` walks the cpuset and calls `cpuset_migrate_mm()` once
+**per task**, and each call queues a work item and returns
+(`kernel/cgroup/cpuset.c`):
+
+```c
+css_task_iter_start(&cs->css, 0, &it);
+while ((task = css_task_iter_next(&it))) {        /* :2641 */
+        ...
+        if (migrate)
+                cpuset_migrate_mm(mm, &cs->old_mems_allowed, &newmems);
+}
+        └─ queue_work(cpuset_migrate_mm_wq, &mwork->work);   /* :2556 */
+
+cpuset_migrate_mm_wq = alloc_ordered_workqueue("cpuset_migrate_mm", 0);  /* :4010 */
+```
+
+The workqueue is **ordered** — `max_active=1` — so N tasks in the cpuset means N
+`lru_cache_disable()` calls run strictly serially on an unbound `kworker/u*`,
+each re-reading `cpu_needs_drain()` for every CPU, for as long as the migration
+takes. The write itself returns immediately. This is why a `D`-state hang shows
+up as `kworker/u<pool>:<n>` blocked with PID 1 piled up behind it, rather than
+PID 1 blocked directly in the write.
+
+It is also why a single drain before the write buys nothing: **the window to
+cover is the whole migration, not the write.**
+
 `__lru_add_drain_all()` in linux-aws 7.0 (`mm/swap.c`):
 
 ```c
@@ -264,13 +293,45 @@ cause 2  __lru_add_drain_all() flush stall  : EXPOSED
 
 ### Arm a cpuset write (the main use)
 
-Drains every isolated CPU, then `exec`s your command. The window between the
-drain and the write is microseconds.
+Drains every isolated CPU, runs your command, and **keeps draining until the
+migration the command triggered has finished** — because that migration runs
+asynchronously, after the write returns (see [The write is not where the
+migration happens](#the-write-is-not-where-the-migration-happens)).
 
 ```bash
 lru-isolate arm -- systemctl set-property my.slice AllowedMemoryNodes=0
 lru-isolate arm -- sh -c 'echo 0 > /sys/fs/cgroup/my.slice/cpuset.mems'
 ```
+
+`arm` drains every `--interval` ms (default **10** for `arm`, vs 1000 for
+`guard`) and stops once `cpuset_migrate_mm_wq` has been idle for 2 s, detected
+by looking for `cpuset_migrate_mm_workfn` on the stack of any `kworker/u*`.
+`--settle MS` caps how long it will keep draining after the command exits
+(default 300000; `0` = no cap). It exits with the command's exit status, so it
+stays usable in a script.
+
+If it hits the cap while the migration is still running it says so — that means
+the migration outlived the drain, and you want `guard` running independently
+rather than a longer `arm`.
+
+Reading `kworker` stacks needs root and `CONFIG_STACKTRACE`. Without them `arm`
+cannot see the workqueue, says so, and falls back to draining for the full
+`--settle` window.
+
+#### The interval is a jitter trade, and 10 ms is not free
+
+A pass costs each isolated core two context switches and one `madvise()`, and on
+`nohz_full` it also drops the core out of tickless mode and back. At the 10 ms
+default that is ~100 passes per second per core, sustained for the whole
+migration — which is a very different jitter profile from the old
+drain-once-and-exec behaviour, and potentially minutes long.
+
+That default is chosen for coverage, not for your latency budget. Measure it
+with `-v` (it reports per-core dispatch and drain latency) and widen
+`--interval` until the jitter fits, accepting that a wider interval leaves more
+of the migration uncovered. The honest position is that this is a coverage/jitter
+dial with no free setting — the only configuration with neither cost is kernel
+patch #3 from the bug.
 
 ### Operating model — how this holds up continually
 
@@ -308,8 +369,15 @@ flush.
 lru-isolate arm -- systemctl set-property my.slice AllowedMemoryNodes=0
 ```
 
-Drain, then `exec`. The gap between the last drain and `__lru_add_drain_all()`
-reading `cpu_needs_drain(cpu)` is microseconds rather than a poll interval.
+Drain, fork the command, and keep draining at a 10 ms interval until the
+migration workqueue goes idle. The point is not the gap before the write — it is
+that every one of the serialized `cpu_needs_drain()` reads the migration makes,
+across its whole duration, lands inside a covered interval.
+
+An earlier version of this tool drained once and `exec`ed, on the assumption
+that the write reached `do_migrate_pages()` synchronously. It does not, so the
+drain threads were gone before the first work item was picked up and `arm`
+did nothing at all.
 
 #### 3. `guard` — insurance for writes you do not control
 
