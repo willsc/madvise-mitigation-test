@@ -38,6 +38,26 @@
  * exec()ed, which tore the drain threads down before the first work item had
  * even been picked up.
  *
+ * HOW WELL THIS SCALES - READ BEFORE DEPLOYING
+ * --------------------------------------------
+ * The css_task_iter_start() above takes flags = 0.  CSS_TASK_ITER_PROCS is
+ * "walk only threadgroup leaders" (include/linux/cgroup.h:46) and is NOT set,
+ * so the walk covers every *thread* and queues a work item for each, even
+ * though threads share an mm.  N threads in the cpuset means N serialized
+ * lru_cache_disable() calls, each re-reading cpu_needs_drain() independently.
+ *
+ * The odds of a clean migration are therefore (1-p)^N, where p is the chance
+ * an isolated CPU carries a dirty batch at any one read.  p is never zero -
+ * writeback completion reaches lru_move_tail from IRQ context with no help
+ * from the RT thread - and the best rate measured for this tool was p = 1.7%.
+ * At N = 148 that is a 7.9% chance of getting through; at N = 384 it is 0.1%.
+ *
+ * Draining harder does not move those numbers; only a smaller N does.  This
+ * tool is honest at N in the single digits.  Above that the fix is to stop
+ * writing cpuset.mems on a live slice (set AllowedMemoryNodes= at slice
+ * creation, before the RT daemon starts), or to patch the kernel.  See the
+ * README section "What actually fixes this".
+ *
  * Verified against linux-aws 7.0 (mm/swap.c):
  *
  *     for_each_online_cpu(cpu) {

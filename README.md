@@ -5,12 +5,17 @@
 > 192-vCPU `c8a.metal-48xl`. PID 1 blocks in `D` for 60 s – 10 min during a
 > `cpuset.mems` write and SSH logins stop working.
 
-**Short answer: yes, a madvise mitigation works — for one of the bug's two
-causes.** It removes the `__lru_add_drain_all()` stall completely, from
-userspace, with no kernel patch and no reboot. It cannot touch the
-`synchronize_rcu_expedited()` stall, which needs a boot parameter.
+**Short answer: only on a cpuset holding a handful of threads, and even then
+for one of the bug's two causes.** The `madvise` lever is real and measurable —
+it removes a CPU from the `__lru_add_drain_all()` flush set — but a
+`cpuset.mems` write queues one migration **per thread** in the cpuset, and each
+one gets an independent chance to hit a dirty batch. At RT-daemon thread counts
+those odds compound to roughly nothing. It never touches the
+`synchronize_rcu_expedited()` stall at all, which needs a boot parameter.
 
-Read [Scope](#scope-what-this-does-and-does-not-fix) before deploying.
+**If you are here because your box still hangs, the useful fixes are in
+[What actually fixes this](#what-actually-fixes-this), not in this tool.** Read
+[Scope](#scope-what-this-does-and-does-not-fix) before deploying anything.
 
 ---
 
@@ -54,6 +59,33 @@ PID 1 blocked directly in the write.
 
 It is also why a single drain before the write buys nothing: **the window to
 cover is the whole migration, not the write.**
+
+### One migration per thread, not per process
+
+The iterator above takes `flags = 0`. `CSS_TASK_ITER_PROCS` is "walk only
+threadgroup leaders" (`include/linux/cgroup.h:46`), and it is **not** set — so
+the walk covers every *thread*, and queues a work item for each one even though
+threads share an `mm`.
+
+A `cpuset.mems` write against a 148-thread RT daemon therefore queues 148 work
+items, each calling `lru_cache_disable()` → `synchronize_rcu_expedited()` +
+`__lru_add_drain_all()`, serially. That is the amplification behind the bug's
+60 s – 10 min, and it is what makes the userspace mitigation untenable at scale:
+each of the 148 items re-reads `cpu_needs_drain(cpu)` independently, so the
+chance of a clean migration is `(1-p)^N` for a per-read dirty probability `p`.
+
+| threads | `p`=1.7% | `p`=0.5% | `p`=0.1% |
+|---|---|---|---|
+| 1 | 98.3% | 99.5% | 99.9% |
+| 16 | 76.0% | 92.3% | 98.4% |
+| 48 | 43.9% | 78.6% | 95.3% |
+| 148 | **7.9%** | 47.6% | 86.2% |
+| 384 | **0.1%** | 14.6% | 68.1% |
+
+`p`=1.7% is the best rate ever measured here (1/60 trials, on a quiet CPU —
+see [Proof](#proof)). Writeback completion reaches `lru_move_tail` from IRQ
+context without the RT thread doing anything, so `p` is never zero. Draining
+harder raises no row in that table by much; only shrinking `N` does.
 
 `__lru_add_drain_all()` in linux-aws 7.0 (`mm/swap.c`):
 
@@ -241,8 +273,49 @@ of a mitigation, not the whole thing.**
 It requires a reboot.
 
 **Complete no-patch mitigation** = boot with `rcupdate.rcu_normal=1` (kills
-cause 1) **+** run `lru-isolate` (kills cause 2). `lru-isolate check` tells you
-which half you are missing.
+cause 1) **+** keep `N` small (see below) **+** run `lru-isolate` (makes cause 2
+unlikely per migration, not impossible). `lru-isolate check` tells you which
+boot parameters you are missing.
+
+### The third axis: `N`
+
+The two-cause table above is necessary but not sufficient, because both causes
+scale with the number of threads in the cpuset. Even a perfect cause-2 fix
+leaves `N` calls to `synchronize_rcu_expedited()`, and `lru-isolate` at its best
+still loses the `(1-p)^N` race at RT thread counts.
+
+**Do not deploy this tool on a cpuset holding hundreds of threads and expect it
+to hold.** It is honest at `N` in the single digits. Above that, shrink `N` or
+fix the kernel.
+
+## What actually fixes this
+
+In the order you should try them.
+
+**1. Stop writing `cpuset.mems` on a live slice.** No reboot, no patch, and it
+removes the amplification rather than racing it. `N` is the thread count *at
+write time*, so set `AllowedMemoryNodes=` when the slice is created, before the
+RT daemon starts. An empty cpuset has nothing to migrate and the stall has no
+fuel. If something in your tooling retunes NUMA on a running slice, removing
+that is worth more than everything else on this page.
+
+**2. Boot with `rcupdate.rcu_normal=1`.** Required for cause 1 regardless of
+anything else, and `N` expedited grace periods is exactly the workload it
+protects against. Not runtime-writable — `module_param(rcu_normal, int, 0444)`.
+
+**3. Add the `domain` flag: `isolcpus=domain,nohz,<list>`.** The
+upstream-supported configuration. It also fixes the `kthread_fetch_affinity()`
+regression (commit 041ee6f3727a) that lets unbound kworkers land on isolated
+CPUs and dirty their batches — i.e. it lowers `p` as well as helping cause 1.
+
+**4. Kernel patch #3 from the bug.** The only actual guarantee: a
+`lru_batching_disabled()` helper that stops isolated CPUs from batching at all,
+so `cpu_needs_drain()` can never be true and the race has no window.
+
+**Where `lru-isolate` still earns its place:** `check` reports which boot
+parameters you are missing, and `lru-verify --decay` measures the real `p` on
+your hardware — the number that decides whether any of this is viable for you.
+Use it as instrumentation first and a mitigation second.
 
 ### Residual: `has_bh_in_lru()`
 
@@ -393,8 +466,10 @@ CPUs.
 
 #### The limit
 
-Even armed, the window is nonzero. **This is a probabilistic mitigation, not a
-guarantee.** The guarantee is kernel patch #3 from the bug — a
+Even armed, the window is nonzero, and it is nonzero once per thread in the
+cpuset — see [One migration per thread](#one-migration-per-thread-not-per-process).
+**This is a probabilistic mitigation whose odds decay geometrically with the
+thread count, not a guarantee.** The guarantee is kernel patch #3 from the bug — a
 `lru_batching_disabled()` helper that skips LRU batching on isolated CPUs
 entirely, so the batch can never become non-empty and the race has no window at
 all. This tool buys you the time until that ships.

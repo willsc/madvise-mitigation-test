@@ -17,6 +17,19 @@ Only the fourth row is a pass. Run all four: rows 2 and 3 are what prove each
 half is actually doing something, and row 2 is the one that gets misread as
 "the mitigation is broken".
 
+### The matrix has a hidden third axis: thread count
+
+Every row above also scales with `N`, the number of **threads** in the cpuset —
+`update_tasks_nodemask()` queues one migration per thread, not per process
+(`css_task_iter_start(..., 0, ...)`; `CSS_TASK_ITER_PROCS` is not set). Each
+migration is an independent chance to stall, so row 4 only passes reliably when
+`N` is small.
+
+**Run the matrix at your real thread count.** A 4-thread test process will pass
+row 4 on a box where your 148-thread daemon still hangs, and you will conclude
+the mitigation works when it does not. If `rt-spinner` is your load, match its
+`--cpus` breadth to the daemon you are actually protecting.
+
 `rcu_normal` is `module_param(..., 0444)` — **not runtime writable**. It is a
 boot parameter, so each row that changes it costs a reboot. Plan the matrix as
 two boots, not four.
