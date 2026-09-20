@@ -344,6 +344,13 @@ point to queued work that still needs its kworker to run. A stack in
 `synchronize_rcu_expedited()` requires separate RCU investigation. Time to
 first hang alone cannot distinguish these cases.
 
+If commands and SSH are unusable during the hang, start
+[`scripts/capture-hang.py`](scripts/capture-hang.py) **before** the reproducer.
+It records task stacks and kernel messages directly for examination after
+recovery. See [the pre-armed capture procedure](TESTING.md#start-automatic-capture-before-triggering-the-hang).
+No command needs to be entered while the host is stuck. A full kernel lockup
+can also stop this collector, so it cannot guarantee a crash record.
+
 ### Residual: `has_bh_in_lru()`
 
 `lru_add_drain()` does not clear the buffer-head LRU, the one remaining

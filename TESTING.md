@@ -249,12 +249,59 @@ Dropping `rcupdate.rcu_normal=1` needs a reboot, as adding it did.
 
 ## Diagnose a delayed hang
 
-Use a disposable target with an existing console session. The bundled
+Capture must be armed **before** the reproducer starts. During the hang,
+assume that new SSH logins and commands in existing shells are unavailable.
+No step below requires an interactive command during that period. The bundled
 `reproducer.tar.xz` contains FIFO/80 workers that continuously refault memory;
 `rt-spinner` only dirties its small allocation at startup. They test different
 refill patterns. Do not treat a pass with `rt-spinner` as a reproducer pass.
 
-For the first comparison, keep the guard interval and all other settings the
+### Start automatic capture before triggering the hang
+
+On the recovered disposable target, from this repository, run:
+
+```bash
+sudo -v
+sudo nohup python3 scripts/capture-hang.py --out /var/tmp/lru-hang-01 \
+    --duration 900 --interval 2 > /var/tmp/lru-hang-01.start.log 2>&1 < /dev/null &
+```
+
+Before launching the reproducer, read `/var/tmp/lru-hang-01.start.log` and
+wait for `READY`. It reports whether PID 1's stack is readable and whether the
+kernel-message reader started. If both are unavailable, it prints `NOT READY`
+and exits nonzero. Resolve capture access before running the test; task-state
+samples alone cannot identify the wait.
+Use a fresh output directory for every run; existing directories are rejected.
+
+The collector pins itself to an allowed CPU outside `nohz_full` and `isolated`.
+It starts all its threads before reporting readiness, then reads `/proc` and
+`/dev/kmsg` directly. It never invokes `systemctl`, starts subprocesses,
+changes RT priorities/sysctls, kills the workload or reboots. A separate thread
+reads kernel messages so a blocked task-stack read need not stop that stream.
+The bundled reproducer already sets `hung_task_timeout_secs=60`; any reports
+the kernel produces can be captured without a new shell or a running journald.
+
+Launch the reproducer as usual **after readiness**, then leave the collector
+alone. Its default capture period is 15 minutes from collector startup. After
+the host recovers (or reboots), retrieve:
+
+- `/var/tmp/lru-hang-01/samples.jsonl`: boot configuration, timestamps,
+  PID 1 and worker stacks, guard-thread CPU time/affinity, and migration counters.
+- `/var/tmp/lru-hang-01/kernel.jsonl`: raw kernel records, including hung-task
+  and RCU reports if generated and readable.
+- `/var/tmp/lru-hang-01.start.log`: readiness and collector errors.
+
+Each JSON record is flushed and fsynced. Use persistent storage: `/tmp` may
+be cleared at reboot. A full kernel lockup, unscheduled collector or blocked
+storage can still stop capture; absence of later records is **not** proof of
+a particular wait. This is not a replacement for a previously configured
+kernel crash dump or external kernel-console recording if userspace cannot
+make progress. Collection also adds housekeeping CPU and I/O load, so use the
+same collection settings in baseline and mitigation runs.
+
+### Compare priority handling only after capture is ready
+
+For a priority comparison, keep the guard interval and all other settings the
 same and use a fixed priority above the bundled workers before starting them:
 
 ```bash
@@ -270,9 +317,10 @@ rescans after 100 ms without a response and raises the drainer priority. Fixed
 
 Record the trigger timestamp separately from script startup: the bundled
 script already sleeps 5 + 25 seconds before its final memory-node restriction.
-Record completed drain passes, the guard's thread priorities, and the longest
-PID 1 D-state interval. From the existing console, inspect `/proc/1/stack`
-and the stack of the blocked migration `kworker/u*` while the stall is present.
+Use the saved timestamps and snapshots to inspect PID 1, the migration worker
+and guard-thread progress after recovery. CPU-time changes show thread activity,
+not proof of successful drain calls. Saved samples also leave gaps, so they
+cannot establish an exact maximum D-state duration.
 
 - Passes stop: check timeout/priority errors. A guard process existing is not
   evidence that its drain threads are still running.

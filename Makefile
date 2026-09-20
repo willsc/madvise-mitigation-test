@@ -34,6 +34,7 @@ verify: lru-verify
 test: lru-isolate tests/test-drainer tests/fail-madvise.so
 	./tests/test-drainer
 	python3 tests/test-cli.py ./lru-isolate ./tests/fail-madvise.so
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/test-capture.py
 
 tests/test-drainer: tests/test-drainer.c src/lru-isolate.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS_PTHREAD)
