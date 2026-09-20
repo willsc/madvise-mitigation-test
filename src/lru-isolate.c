@@ -10,7 +10,7 @@
  *
  *     cpuset_migrate_mm() -> do_migrate_pages() -> lru_cache_disable()
  *         -> synchronize_rcu_expedited()          [cause 1 - NOT fixed here]
- *         -> __lru_add_drain_all(true)            [cause 2 - fixed here]
+ *         -> __lru_add_drain_all(true)            [cause 2 - race reduced]
  *
  * __lru_add_drain_all() queues a per-CPU work item to every CPU for which
  * cpu_needs_drain(cpu) is true, then flush_work()s each one.  On a CPU that
@@ -21,7 +21,8 @@
  * --------------------------------------------
  * do_migrate_pages() does NOT run in the context of the cpuset.mems write.
  * update_tasks_nodemask() walks the cpuset and calls cpuset_migrate_mm() once
- * per task; each call queues a work item and the write returns immediately:
+ * per task; each call queues a work item. The writer then flushes that queue
+ * from task_work before returning to userspace:
  *
  *     kernel/cgroup/cpuset.c:2641  while ((task = css_task_iter_next(&it)))
  *     kernel/cgroup/cpuset.c:2556      queue_work(cpuset_migrate_mm_wq, ...)
@@ -34,9 +35,8 @@
  *
  * So a drain that happens once, before the write, covers none of them.  `arm'
  * therefore forks the command and keeps draining until the migration has
- * actually drained out - see cmd_arm().  An earlier version drained once and
- * exec()ed, which tore the drain threads down before the first work item had
- * even been picked up.
+ * drained out - see cmd_arm(). A one-shot drain cannot cover all the later
+ * queueing decisions, whether or not the command has returned.
  *
  * HOW WELL THIS SCALES - READ BEFORE DEPLOYING
  * --------------------------------------------
@@ -44,19 +44,13 @@
  * "walk only threadgroup leaders" (include/linux/cgroup.h:46) and is NOT set,
  * so the walk covers every *thread* and queues a work item for each, even
  * though threads share an mm.  N threads in the cpuset means N serialized
- * lru_cache_disable() calls, each re-reading cpu_needs_drain() independently.
+ * lru_cache_disable() calls, each re-reading cpu_needs_drain().
  *
- * The odds of a clean migration are therefore (1-p)^N, where p is the chance
- * an isolated CPU carries a dirty batch at any one read.  p is never zero -
- * writeback completion reaches lru_move_tail from IRQ context with no help
- * from the RT thread - and the best rate measured for this tool was p = 1.7%.
- * At N = 148 that is a 7.9% chance of getting through; at N = 384 it is 0.1%.
- *
- * Draining harder does not move those numbers; only a smaller N does.  This
- * tool is honest at N in the single digits.  Above that the fix is to stop
- * writing cpuset.mems on a live slice (set AllowedMemoryNodes= at slice
- * creation, before the RT daemon starts), or to patch the kernel.  See the
- * README section "What actually fixes this".
+ * More calls provide more opportunities to encounter a dirty CPU, but those
+ * observations need not be independent. Desktop verification results cannot
+ * predict the failure probability of the continuously refaulting reproducer.
+ * Once work has been queued, madvise does not complete that work item: the
+ * kernel worker still has to run. See the README for the residual race.
  *
  * Verified against linux-aws 7.0 (mm/swap.c):
  *
@@ -292,25 +286,30 @@ static int count_mask(const char *mask)
  * 41 = policy.  comm (field 2) may contain spaces and parens, so scan from
  * the last ')'.
  *
- * Two things matter here:
+ * Things that matter here:
  *  - iterate /proc/<pid>/task/<tid>, not just <pid>.  A busy-poll spinner is
  *    usually one thread of a larger process, and the thread-group leader is
  *    typically not the pinned RT thread.
  *  - skip kernel threads (PF_KTHREAD).  migration/N and the per-CPU RCU
  *    kthreads sit at SCHED_FIFO 99 on every CPU, and treating them as the
  *    thing to preempt would push every drain to priority 99 for no reason.
+ *  - skip our own process during rescans; use each task's allowed CPUs, since
+ *    its last reported CPU does not constrain where it can run next.
  */
 static void scan_rt_prios(int *percpu_max)
 {
 	DIR *proc;
 	struct dirent *pe;
+	cpu_set_t *affinity = CPU_ALLOC((size_t)g_ncpu);
 
 	for (int c = 0; c < g_ncpu; c++)
 		percpu_max[c] = 0;
 
 	proc = opendir("/proc");
-	if (!proc)
+	if (!proc) {
+		CPU_FREE(affinity);
 		return;
+	}
 
 	while ((pe = readdir(proc))) {
 		char tdir[320];
@@ -318,6 +317,9 @@ static void scan_rt_prios(int *percpu_max)
 		struct dirent *te;
 
 		if (!isdigit((unsigned char)pe->d_name[0]))
+			continue;
+		/* A rescan must not count our own drainers and boost itself. */
+		if (strtol(pe->d_name, NULL, 10) == (long)getpid())
 			continue;
 		snprintf(tdir, sizeof(tdir), "/proc/%s/task", pe->d_name);
 		tasks = opendir(tdir);
@@ -364,14 +366,22 @@ static void scan_rt_prios(int *percpu_max)
 				continue;
 			if (policy != SCHED_FIFO && policy != SCHED_RR)
 				continue;
-			if (processor < 0 || processor >= g_ncpu)
-				continue;
-			if (rtprio > percpu_max[processor])
+			/* A runnable RT task can move after the last-CPU sample. */
+			if (affinity && sched_getaffinity((pid_t)strtol(te->d_name,
+					NULL, 10), g_setsz, affinity) == 0) {
+				for (int c = 0; c < g_ncpu; c++)
+					if (CPU_ISSET_S((size_t)c, g_setsz, affinity) &&
+					    rtprio > percpu_max[c])
+						percpu_max[c] = rtprio;
+			} else if (processor >= 0 && processor < g_ncpu &&
+				   rtprio > percpu_max[processor]) {
 				percpu_max[processor] = rtprio;
+			}
 		}
 		closedir(tasks);
 	}
 	closedir(proc);
+	CPU_FREE(affinity);
 }
 
 /* ------------------------------------------------------------------- drainers */
@@ -388,7 +398,6 @@ struct drainer {
 	int rtprio;
 	pthread_t th;
 	int live;		/* thread was created */
-	int rt_denied;		/* wanted SCHED_FIFO, got SCHED_OTHER */
 
 	atomic_int req;		/* pass generation requested */
 	atomic_int done;	/* pass generation completed */
@@ -409,6 +418,73 @@ static int g_ndr;
 static int g_gen;
 static void *g_region;
 static size_t g_region_len;
+static int *g_rtmax;
+
+/* Controller waits are bounded even when a later FIFO task starves a drainer.
+ * Keep the workers' idle waits unbounded: they should sleep between passes. */
+#define DRAIN_RECHECK_MS 100
+#define DRAIN_TIMEOUT_MS 5000
+
+static int refresh_rt_prios(void)
+{
+	if (!g_rtmax)
+		return 0; /* explicit priority: diagnose a timeout, do not override it */
+	scan_rt_prios(g_rtmax);
+	for (int k = 0; k < g_ndr; k++) {
+		struct drainer *d = &g_dr[k];
+		int m = g_rtmax[d->cpu], rc;
+		struct sched_param sp = { .sched_priority = m + 1 };
+
+		if (!d->live || !m)
+			continue;
+		if (m >= 99) {
+			fprintf(stderr, "cpu%d: userspace RT priority 99 leaves no "
+				"higher FIFO priority for the drainer\n", d->cpu);
+			return -1;
+		}
+		if (sp.sched_priority <= d->rtprio)
+			continue;
+		rc = pthread_setschedparam(d->th, SCHED_FIFO, &sp);
+		if (rc) {
+			fprintf(stderr, "cpu%d: cannot raise drainer to FIFO/%d: %s "
+				"(CAP_SYS_NICE required)\n", d->cpu,
+				sp.sched_priority, strerror(rc));
+			return -1;
+		}
+		fprintf(stderr, "cpu%d: raising drainer priority %d -> FIFO/%d "
+			"after a delayed dispatch\n", d->cpu, d->rtprio,
+			sp.sched_priority);
+		d->rtprio = sp.sched_priority;
+	}
+	return 0;
+}
+
+static int wait_for_drainer(struct drainer *d, atomic_int *counter, int wanted,
+			    const char *phase)
+{
+	struct timespec start, now;
+	const struct timespec poll = { .tv_nsec = DRAIN_RECHECK_MS * 1000000L };
+	int v;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	while ((v = atomic_load(counter)) != wanted) {
+		syscall(SYS_futex, (void *)counter, FUTEX_WAIT_PRIVATE, v,
+			&poll, NULL, 0);
+		if (atomic_load(counter) == wanted)
+			return 0;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (delta_us(start, now) / 1000.0 >= DRAIN_TIMEOUT_MS) {
+			fprintf(stderr, "cpu%d: drainer %s timed out after %d ms "
+				"(priority %d); mitigation is not progressing. "
+				"Check RT priorities, affinity and blocked-task stacks.\n",
+				d->cpu, phase, DRAIN_TIMEOUT_MS, d->rtprio);
+			return -1;
+		}
+		if (refresh_rt_prios() != 0)
+			return -1;
+	}
+	return 0;
+}
 
 static void *drain_loop(void *arg)
 {
@@ -497,7 +573,6 @@ static void pin_to_housekeeping(const char *mask, cpu_set_t *allowed)
 static int drainers_start(const char *mask, int rtprio_opt)
 {
 	cpu_set_t *allowed, *one;
-	int *rtmax = NULL;
 	size_t pagesz = (size_t)sysconf(_SC_PAGESIZE);
 	int n = count_mask(mask), i = 0, unreachable = 0;
 
@@ -614,9 +689,12 @@ static int drainers_start(const char *mask, int rtprio_opt)
 	g_ndr = n;
 
 	if (rtprio_opt < 0) {
-		rtmax = calloc((size_t)g_ncpu, sizeof(int));
-		if (rtmax)
-			scan_rt_prios(rtmax);
+		g_rtmax = calloc((size_t)g_ncpu, sizeof(int));
+		if (!g_rtmax) {
+			fprintf(stderr, "out of memory scanning RT priorities\n");
+			return -1;
+		}
+		scan_rt_prios(g_rtmax);
 	}
 
 	for (int c = 0; c < g_ncpu; c++) {
@@ -637,9 +715,14 @@ static int drainers_start(const char *mask, int rtprio_opt)
 
 		d->rtprio = rtprio_opt;
 		if (rtprio_opt < 0) {
-			int m = rtmax ? rtmax[c] : 0;
+			int m = g_rtmax[c];
 
-			d->rtprio = m ? (m + 1 > 99 ? 99 : m + 1) : 0;
+			if (m >= 99) {
+				fprintf(stderr, "cpu%d: userspace RT priority 99 leaves "
+					"no higher FIFO priority for the drainer\n", c);
+				return -1;
+			}
+			d->rtprio = m ? m + 1 : 0;
 			vrb("cpu%d: highest userspace RT prio = %d, drain prio = %d\n",
 			    c, m, d->rtprio);
 		}
@@ -657,38 +740,29 @@ static int drainers_start(const char *mask, int rtprio_opt)
 			pthread_attr_setschedparam(&attr, &sp);
 		}
 		rc = pthread_create(&d->th, &attr, drain_loop, d);
-		if (rc == EPERM && d->rtprio > 0) {
-			/* no CAP_SYS_NICE: still drain the CPUs that are not
-			 * FIFO-saturated rather than failing outright */
-			pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
-			d->rt_denied = 1;
-			d->rtprio = 0;
-			rc = pthread_create(&d->th, &attr, drain_loop, d);
-		}
 		pthread_attr_destroy(&attr);
 
 		if (rc) {
 			fprintf(stderr, "cpu%d: pthread_create: %s\n", c,
 				strerror(rc));
 			d->err = rc;
+			return -1;
 		} else {
 			d->live = 1;
 		}
 		i++;
 	}
-	free(rtmax);
 	CPU_FREE(allowed);
 	CPU_FREE(one);
 
 	/* wait for each thread to land on its CPU before the first pass */
 	for (int k = 0; k < g_ndr; k++) {
 		struct drainer *d = &g_dr[k];
-		int v;
 
 		if (!d->live)
 			continue;
-		while ((v = atomic_load(&d->ready)) == 0)
-			futex_wait(&d->ready, v);
+		if (wait_for_drainer(d, &d->ready, 1, "startup") != 0)
+			return -1;
 		if (d->ran_on != d->cpu)
 			fprintf(stderr,
 				"warning: cpu%d drainer landed on cpu%d - "
@@ -711,6 +785,8 @@ static void drainers_stop(void)
 	free(g_dr);
 	g_dr = NULL;
 	g_ndr = 0;
+	free(g_rtmax);
+	g_rtmax = NULL;
 	if (g_region)
 		munmap(g_region, g_region_len);
 	g_region = NULL;
@@ -809,7 +885,7 @@ static int drain_pass(struct opts *o, int report)
 {
 	struct timespec p0, p1;
 	double worst_sched = 0, total = 0;
-	int failed = 0, rtdenied = 0, live = 0;
+	int failed = 0, live = 0;
 
 	g_gen++;
 
@@ -824,21 +900,18 @@ static int drain_pass(struct opts *o, int report)
 		futex_wake(&d->req, 1);
 
 		if (o->serial) {
-			int v;
-
-			while ((v = atomic_load(&d->done)) != g_gen)
-				futex_wait(&d->done, v);
+			if (wait_for_drainer(d, &d->done, g_gen, "pass") != 0)
+				return 1;
 		}
 	}
 	if (!o->serial) {
 		for (int k = 0; k < g_ndr; k++) {
 			struct drainer *d = &g_dr[k];
-			int v;
 
 			if (!d->live)
 				continue;
-			while ((v = atomic_load(&d->done)) != g_gen)
-				futex_wait(&d->done, v);
+			if (wait_for_drainer(d, &d->done, g_gen, "pass") != 0)
+				return 1;
 		}
 	}
 	clock_gettime(CLOCK_MONOTONIC, &p1);
@@ -854,10 +927,11 @@ static int drain_pass(struct opts *o, int report)
 			continue;
 		}
 		live++;
-		if (d->rt_denied)
-			rtdenied++;
-		if (d->err)
+		if (d->err) {
 			failed++;
+			fprintf(stderr, "cpu%d: madvise drain failed: %s\n",
+				d->cpu, strerror(d->err));
+		}
 		if (d->sched_us > worst_sched)
 			worst_sched = d->sched_us;
 		total += d->drain_us;
@@ -869,7 +943,7 @@ static int drain_pass(struct opts *o, int report)
 	if (o->json) {
 		printf("{\"cpus\":%d,\"failed\":%d,\"rt_denied\":%d,"
 		       "\"pass_us\":%.1f,\"worst_sched_us\":%.1f,\"drains\":[",
-		       live, failed, rtdenied, delta_us(p0, p1), worst_sched);
+		       live, failed, 0, delta_us(p0, p1), worst_sched);
 		for (int k = 0; k < g_ndr; k++) {
 			struct drainer *d = &g_dr[k];
 
@@ -882,11 +956,7 @@ static int drain_pass(struct opts *o, int report)
 	} else {
 		printf("drained %d CPU(s) in %.1f us (worst dispatch %.1f us, "
 		       "drain cost %.1f us total)\n",
-		       live, delta_us(p0, p1), worst_sched, total);
-		if (rtdenied)
-			printf("  warning: %d CPU(s) fell back to SCHED_OTHER "
-			       "(need CAP_SYS_NICE to preempt FIFO spinners)\n",
-			       rtdenied);
+		       live - failed, delta_us(p0, p1), worst_sched, total);
 		if (verbose)
 			for (int k = 0; k < g_ndr; k++) {
 				struct drainer *d = &g_dr[k];
@@ -920,7 +990,7 @@ static void arm_sighandler(int s)
  *
  * The window that matters is not "drain -> write".  It is "drain -> every
  * cpu_needs_drain() read made by every queued cpuset_migrate_mm work item",
- * and those run on an unbound kworker after the write has already returned.
+ * and those run on an unbound kworker while the writer waits for completion.
  * See "THE WRITE IS NOT WHERE THE MIGRATION HAPPENS" at the top of this file.
  */
 static int cmd_arm(struct opts *o, char **argv, int execpos)
@@ -937,8 +1007,8 @@ static int cmd_arm(struct opts *o, char **argv, int execpos)
 
 	/* one drain before the write, as before */
 	rc = drain_pass(o, 1);
-	if (rc > 1) {
-		drainers_stop();
+	if (rc) {
+		/* Exiting terminates all drainers; joining a starved one can hang. */
 		return rc;
 	}
 
@@ -967,7 +1037,12 @@ static int cmd_arm(struct opts *o, char **argv, int execpos)
 	ts.tv_nsec = (long)(o->interval_ms % 1000) * 1000000L;
 
 	for (;;) {
-		drain_pass(o, 0);
+		if (drain_pass(o, 0) != 0) {
+			fprintf(stderr, "arm: drain failed; command PID %ld may still "
+				"be running and migration completion is unknown\n",
+				(long)pid);
+			return 1;
+		}
 		passes++;
 
 		if (g_fwd_sig) {
@@ -1179,6 +1254,9 @@ static void usage(void)
 "                        'auto' (default) picks the highest userspace RT\n"
 "                        priority seen on each target CPU + 1, so it can\n"
 "                        preempt the busy-poll thread.\n"
+"                        Rechecks after 100 ms without a response and raises\n"
+"                        priority for RT tasks started later. A drainer wait\n"
+"                        fails after 5 s; RT permission failures are fatal.\n"
 "  -i, --interval MS     drain interval: guard default 1000, arm default 10\n"
 "      --settle MS       arm: cap on how long to keep draining after the\n"
 "                        command exits (default 300000, 0 = no cap). arm\n"
@@ -1194,9 +1272,9 @@ static void usage(void)
 "why arm does not just exec:\n"
 "  A cpuset.mems write does not migrate anything itself. It queues one work\n"
 "  item per task in the cpuset onto cpuset_migrate_mm_wq - an ordered, unbound\n"
-"  workqueue - and returns. Those items call lru_cache_disable() serially, on\n"
-"  a kworker/u*, long after your command has exited. Draining once and exec()ing\n"
-"  tears the drain threads down before the first one is picked up.\n"
+"  workqueue. The writer flushes that queue from task_work before returning\n"
+"  to userspace. Those items call lru_cache_disable() serially on a kworker/u*.\n"
+"  Draining once cannot cover the whole migration.\n"
 "\n"
 "isolated cores:\n"
 "  Drain threads are created once and parked on a futex, so a pass costs two\n"
@@ -1300,7 +1378,8 @@ int main(int argc, char **argv)
 		if (drainers_start(o.mask, o.rtprio) != 0)
 			return 1;
 		rc = drain_pass(&o, 1);
-		drainers_stop();
+		if (!rc)
+			drainers_stop();
 		return rc;
 	}
 
@@ -1313,7 +1392,8 @@ int main(int argc, char **argv)
 		if (drainers_start(o.mask, o.rtprio) != 0)
 			return 1;
 		for (;;) {
-			drain_pass(&o, 1);
+			if (drain_pass(&o, 1) != 0)
+				return 1;
 			nanosleep(&ts, NULL);
 		}
 	}
@@ -1324,8 +1404,8 @@ int main(int argc, char **argv)
 			return 2;
 		}
 		/*
-		 * The migration runs asynchronously and serially after the
-		 * write returns, so arm drains continuously rather than once.
+		 * The migration runs serially on a worker while the writer can
+		 * block, so arm drains continuously rather than once.
 		 * A 1 s guard interval would leave most of that uncovered.
 		 */
 		if (!explicit_interval)

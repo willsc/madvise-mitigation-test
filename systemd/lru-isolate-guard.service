@@ -1,10 +1,9 @@
-# Keeps the per-CPU LRU batches on isolated CPUs empty, so a cpuset.mems
-# write never queues drain work to a FIFO-saturated CPU.  Mitigation for
+# Periodically drains isolated-CPU LRU batches to reduce the chance that a
+# cpuset.mems write queues work to a FIFO-saturated CPU.  Mitigation for
 # Ubuntu LP#2165410 (cause 2 only - see the README for cause 1).
 #
-# Tune --interval to your workload: the batches only refill when the isolated
-# CPU itself faults in pages, which a well-behaved pre-faulted RT thread does
-# not do, so a slow interval is usually enough.
+# Refaults and IRQ activity can refill batches between passes. This cannot
+# complete work already queued to a starved kworker; see README limitations.
 [Unit]
 Description=Keep isolated-CPU LRU batches drained (LP#2165410 mitigation)
 Documentation=https://bugs.launchpad.net/ubuntu/+source/linux-aws/+bug/2165410
@@ -13,7 +12,8 @@ After=multi-user.target
 [Service]
 Type=simple
 # --rtprio auto raises the drain thread just above the highest SCHED_FIFO
-# priority seen on each target CPU, so it can preempt the busy-poll thread.
+# priority allowed on each target CPU. Delayed drain responses trigger a
+# rescan for workloads started after the guard; unresolved waits fail after 5 s.
 ExecStart=/usr/local/bin/lru-isolate guard --interval 1000 --rtprio auto
 Restart=on-failure
 RestartSec=5

@@ -4,3 +4,5 @@
 /premigrate
 /rt-spinner
 /lru-probe
+/tests/test-drainer
+/tests/fail-madvise.so

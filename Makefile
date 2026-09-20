@@ -30,6 +30,17 @@ check: lru-isolate
 verify: lru-verify
 	./lru-verify
 
+# Controller regression tests: no FIFO spinners, NUMA changes or tracing.
+test: lru-isolate tests/test-drainer tests/fail-madvise.so
+	./tests/test-drainer
+	python3 tests/test-cli.py ./lru-isolate ./tests/fail-madvise.so
+
+tests/test-drainer: tests/test-drainer.c src/lru-isolate.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS_PTHREAD)
+
+tests/fail-madvise.so: tests/fail-madvise.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
 # is the drained state stable, or is guard just losing the race slower?
 decay: lru-verify
 	./lru-verify --decay
@@ -50,5 +61,6 @@ uninstall:
 
 clean:
 	rm -f $(BINS) lru-probe
+	rm -f tests/test-drainer tests/fail-madvise.so
 
-.PHONY: all check verify decay install uninstall clean
+.PHONY: all check verify test decay install uninstall clean

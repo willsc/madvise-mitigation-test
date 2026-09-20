@@ -2,33 +2,26 @@
 
 ## Read this first: the 2×2 or you will draw the wrong conclusion
 
-LP#2165410 has **two independent causes**. `lru-isolate` fixes one of them.
-`rcupdate.rcu_normal=1` fixes the other. Test either one alone and the cpuset
-write still stalls, and you will conclude the tool does not work.
+LP#2165410 has separate RCU and LRU-worker blocking paths. The madvise tool
+reduces opportunities to queue LRU drain work; it does not guarantee progress
+once that work has been queued. A delayed hang is a failed mitigation run and
+a useful diagnostic observation, not proof that either cause is fixed.
 
-| `rcupdate.rcu_normal` | `lru-isolate` | cause 1 (RCU expedited) | cause 2 (LRU flush) | expected result |
-|---|---|---|---|---|
-| `0` | off | stalls | stalls | **full stall** — the bug |
-| `0` | on  | stalls | fixed  | **still stalls** ← the trap |
-| `1` | off | fixed  | stalls | **still stalls** |
-| `1` | on  | fixed  | fixed  | **no stall** |
+| `rcupdate.rcu_normal` | `lru-isolate` | what to investigate |
+|---|---|---|
+| `0` | off | baseline RCU and LRU-worker blocking |
+| `0` | on | RCU blocking remains; LRU queueing can still race the drain |
+| `1` | off | normal RCU grace periods; LRU-worker starvation remains |
+| `1` | on | candidate combination; still requires repeated workload tests |
 
-Only the fourth row is a pass. Run all four: rows 2 and 3 are what prove each
-half is actually doing something, and row 2 is the one that gets misread as
-"the mitigation is broken".
+Capture the blocked stack in every failing run. Do not identify the remaining
+cause from the matrix alone. `rcu_normal=1` selects normal RCU grace periods;
+it does not make all RCU waits impossible.
 
-### The matrix has a hidden third axis: thread count
-
-Every row above also scales with `N`, the number of **threads** in the cpuset —
-`update_tasks_nodemask()` queues one migration per thread, not per process
-(`css_task_iter_start(..., 0, ...)`; `CSS_TASK_ITER_PROCS` is not set). Each
-migration is an independent chance to stall, so row 4 only passes reliably when
-`N` is small.
-
-**Run the matrix at your real thread count.** A 4-thread test process will pass
-row 4 on a box where your 148-thread daemon still hangs, and you will conclude
-the mitigation works when it does not. If `rt-spinner` is your load, match its
-`--cpus` breadth to the daemon you are actually protecting.
+Run at the real thread count and CPU layout. `update_tasks_nodemask()` walks
+threads and can queue migration for their shared address space repeatedly.
+This provides more queueing opportunities, but the trials are not known to be
+independent. The desktop 1/60 result is not a fleet failure probability.
 
 `rcu_normal` is `module_param(..., 0444)` — **not runtime writable**. It is a
 boot parameter, so each row that changes it costs a reboot. Plan the matrix as
@@ -38,14 +31,17 @@ two boots, not four.
 
 ## Stage 0 — build
 
-Nothing here has been compiled yet.
+Build the binaries and run the controller regression tests locally:
 
 ```bash
-cd /opt/madvise-mitigation
+cd /opt/madvise-mitigation-test
 make
+make test
 ```
 
-Expect to fix compile errors first. Then the no-privilege smoke test:
+The regression tests mock RT scheduling; they do not run a FIFO spinner or
+change cpusets. They cover late workload startup, priority increases, failed
+drains, permission failures and timeouts. Then run the smoke test:
 
 ```bash
 ./lru-isolate --help
@@ -123,8 +119,9 @@ time sudo ./lru-isolate arm -- systemctl set-property test.slice AllowedMemoryNo
 ```
 
 Note what `time` measures here. `arm` does **not** return when `systemctl`
-returns: the migration runs asynchronously on `cpuset_migrate_mm_wq` after the
-write, so `arm` keeps draining until that workqueue has been idle for 2 s. The
+returns: the migration runs on `cpuset_migrate_mm_wq`, and the writer flushes the queue
+from task_work before returning to userspace. `arm` drains while the command
+runs and continues until its workqueue sampling has seen 2 s of quiet. The
 elapsed time is therefore roughly *migration duration + 2 s*, and that is the
 number you want — it is how long the stall would have had to be covered for.
 The thing to compare against the unarmed run is PID 1's state, not the
@@ -142,8 +139,8 @@ If it prints `warning: cpuset_migrate_mm_wq still busy at the --settle cap`,
 the migration outlived the drain window — raise `--settle` or run `guard`
 alongside.
 
-Compare against the 2×2 above. If row 2 still stalls, that is expected and
-correct — it is cause 1, and it needs the reboot.
+Compare against the matrix above and classify failures by their captured
+stacks. Even with the guard running, an LRU drain race can still cause a stall.
 
 ### Prove the batch state is what matters
 
@@ -205,7 +202,8 @@ boot parameter:
 This is the real deployment decision.
 
 **You control the write** — you run `systemctl set-property`, or a script does.
-Wrap it. This is deterministic and is what you should rely on:
+Wrap it to keep draining throughout the command. This still has a race with
+kernel work queueing:
 
 ```bash
 lru-isolate arm -- systemctl set-property my.slice AllowedMemoryNodes=0
@@ -227,7 +225,7 @@ in order of preference:
 ### Verify in production
 
 ```bash
-lru-isolate check               # expect: both causes mitigated
+lru-isolate check               # configuration snapshot, not proof of coverage
 systemctl status lru-isolate-guard
 lru-isolate drain -v            # dispatch/drain latency on live isolated cores
 ```
@@ -249,9 +247,47 @@ Nothing persists: no kernel module, no sysctl, no boot parameter of its own, and
 `lru-verify` removes its kprobe by name on exit and restores `tracing_on`.
 Dropping `rcupdate.rcu_normal=1` needs a reboot, as adding it did.
 
+## Diagnose a delayed hang
+
+Use a disposable target with an existing console session. The bundled
+`reproducer.tar.xz` contains FIFO/80 workers that continuously refault memory;
+`rt-spinner` only dirties its small allocation at startup. They test different
+refill patterns. Do not treat a pass with `rt-spinner` as a reproducer pass.
+
+For the first comparison, keep the guard interval and all other settings the
+same and use a fixed priority above the bundled workers before starting them:
+
+```bash
+sudo ./lru-isolate guard --cpus 18-95,108-178 --interval 1000 --rtprio 81 -v
+```
+
+This CPU list is specific to the bundled reproducer; adapt it to the target.
+Use one guard instance, and replace 1000 with the previous interval if different.
+The former auto mode sampled priorities only at startup and could remain at
+normal priority when the FIFO workers started later. The updated auto mode
+rescans after 100 ms without a response and raises the drainer priority. Fixed
+81 removes that recovery delay for the known FIFO/80 workload.
+
+Record the trigger timestamp separately from script startup: the bundled
+script already sleeps 5 + 25 seconds before its final memory-node restriction.
+Record completed drain passes, the guard's thread priorities, and the longest
+PID 1 D-state interval. From the existing console, inspect `/proc/1/stack`
+and the stack of the blocked migration `kworker/u*` while the stall is present.
+
+- Passes stop: check timeout/priority errors. A guard process existing is not
+  evidence that its drain threads are still running.
+- Passes continue and migration waits in `flush_work()` beneath
+  `__lru_add_drain_all()`: a local madvise drain cannot complete the already
+  queued work item; the kernel worker needs CPU time.
+- Migration waits in `synchronize_rcu_expedited()`: investigate the RCU workers
+  and boot configuration separately.
+
+Only after this comparison should you change the interval, one variable at a
+time. Repeat runs and report time from the trigger to first hang; do not infer
+a reliable mitigation from one later failure.
+
 ## What would make this unnecessary
 
-Kernel patch #3 from the bug — a `lru_batching_disabled()` helper that skips LRU
-batching on isolated CPUs entirely, so the batch can never become non-empty and
-there is no race window at all. Everything here is a userspace approximation of
-that patch. Track the bug; when the patched kernel ships, this comes out.
+A kernel fix must prevent or resolve work queued to a CPU whose worker cannot
+run. The proposed batching patch needs validation against all drain conditions,
+including mlock and buffer heads, and the RCU path needs separate coverage.

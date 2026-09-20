@@ -5,13 +5,13 @@
 > 192-vCPU `c8a.metal-48xl`. PID 1 blocks in `D` for 60 s – 10 min during a
 > `cpuset.mems` write and SSH logins stop working.
 
-**Short answer: only on a cpuset holding a handful of threads, and even then
-for one of the bug's two causes.** The `madvise` lever is real and measurable —
+**This is a partial mitigation, not a demonstrated fix for the reproducer.**
+The `madvise` lever is real and measurable —
 it removes a CPU from the `__lru_add_drain_all()` flush set — but a
 `cpuset.mems` write queues one migration **per thread** in the cpuset, and each
-one gets an independent chance to hit a dirty batch. At RT-daemon thread counts
-those odds compound to roughly nothing. It never touches the
-`synchronize_rcu_expedited()` stall at all, which needs a boot parameter.
+one makes another queueing decision that may encounter a dirty batch.
+More threads and continuously refaulting workloads increase exposure. The
+`synchronize_rcu_expedited()` blocking path needs separate mitigation.
 
 **If you are here because your box still hangs, the useful fixes are in
 [What actually fixes this](#what-actually-fixes-this), not in this tool.** Read
@@ -53,12 +53,14 @@ cpuset_migrate_mm_wq = alloc_ordered_workqueue("cpuset_migrate_mm", 0);  /* :401
 The workqueue is **ordered** — `max_active=1` — so N tasks in the cpuset means N
 `lru_cache_disable()` calls run strictly serially on an unbound `kworker/u*`,
 each re-reading `cpu_needs_drain()` for every CPU, for as long as the migration
-takes. The write itself returns immediately. This is why a `D`-state hang shows
-up as `kworker/u<pool>:<n>` blocked with PID 1 piled up behind it, rather than
-PID 1 blocked directly in the write.
+takes. The writer schedules `flush_migrate_mm_task_workfn()` with `TWA_RESUME`;
+that callback calls `flush_workqueue()` before returning to userspace.
+The write can therefore block while the migration worker runs. A `D`-state
+hang can show `kworker/u<pool>:<n>` blocked in migration with PID 1 waiting
+for the queue to flush.
 
-It is also why a single drain before the write buys nothing: **the window to
-cover is the whole migration, not the write.**
+A single drain may prevent the first queueing decision but cannot cover later
+ones: **the window to cover is the whole migration.**
 
 ### One migration per thread, not per process
 
@@ -69,10 +71,12 @@ threads share an `mm`.
 
 A `cpuset.mems` write against a 148-thread RT daemon therefore queues 148 work
 items, each calling `lru_cache_disable()` → `synchronize_rcu_expedited()` +
-`__lru_add_drain_all()`, serially. That is the amplification behind the bug's
-60 s – 10 min, and it is what makes the userspace mitigation untenable at scale:
-each of the 148 items re-reads `cpu_needs_drain(cpu)` independently, so the
-chance of a clean migration is `(1-p)^N` for a per-read dirty probability `p`.
+`__lru_add_drain_all()`, serially. This can amplify the time spent in migration:
+each of the 148 items re-reads `cpu_needs_drain(cpu)`, so there are repeated
+opportunities to encounter a dirty CPU.
+Under a simplifying assumption of independent observations with constant
+per-migration failure probability `p`, the chance of a clean run would be
+`(1-p)^N`. Neither independence nor that `p` has been measured on the target.
 
 | threads | `p`=1.7% | `p`=0.5% | `p`=0.1% |
 |---|---|---|---|
@@ -82,10 +86,12 @@ chance of a clean migration is `(1-p)^N` for a per-read dirty probability `p`.
 | 148 | **7.9%** | 47.6% | 86.2% |
 | 384 | **0.1%** | 14.6% | 68.1% |
 
-`p`=1.7% is the best rate ever measured here (1/60 trials, on a quiet CPU —
-see [Proof](#proof)). Writeback completion reaches `lru_move_tail` from IRQ
-context without the RT thread doing anything, so `p` is never zero. Draining
-harder raises no row in that table by much; only shrinking `N` does.
+The table is illustrative, not a prediction. The 1/60 result in
+[Proof](#proof) measures one desktop CPU after one drain; it does not estimate
+the probability of any target CPU being dirty during a real migration.
+Writeback completion can reach `lru_move_tail` from IRQ context without the RT
+thread doing anything. Changing the drain interval or workload can change
+the probability; this requires measurement on the target machine.
 
 `__lru_add_drain_all()` in linux-aws 7.0 (`mm/swap.c`):
 
@@ -259,7 +265,7 @@ dispatch.
 | | Cause 1 — `synchronize_rcu_expedited()` | Cause 2 — `__lru_add_drain_all()` |
 |---|---|---|
 | Blocks because | `rcu_exp_par_gp_kthread_worker/N` is pinned to a nohz_full CPU and starves behind the FIFO spinner | the per-CPU kworker never runs on a FIFO-saturated CPU, so `flush_work()` waits |
-| Fixed by this tool | **No** | **Yes** |
+| Fixed by this tool | **No** | **No guarantee; reduces queueing opportunities** |
 | Fix without a kernel patch | `rcupdate.rcu_normal=1` **at boot**, or `isolcpus=domain,nohz,<list>` | `lru-isolate` |
 
 `do_migrate_pages()` calls `lru_cache_disable()` unconditionally, and
@@ -272,7 +278,7 @@ of a mitigation, not the whole thing.**
 0444)`, confirmed by `-r--r--r--` on `/sys/module/rcupdate/parameters/rcu_normal`.
 It requires a reboot.
 
-**Complete no-patch mitigation** = boot with `rcupdate.rcu_normal=1` (kills
+**Partial no-patch mitigation** = boot with `rcupdate.rcu_normal=1` (kills
 cause 1) **+** keep `N` small (see below) **+** run `lru-isolate` (makes cause 2
 unlikely per migration, not impossible). `lru-isolate check` tells you which
 boot parameters you are missing.
@@ -281,12 +287,12 @@ boot parameters you are missing.
 
 The two-cause table above is necessary but not sufficient, because both causes
 scale with the number of threads in the cpuset. Even a perfect cause-2 fix
-leaves `N` calls to `synchronize_rcu_expedited()`, and `lru-isolate` at its best
-still loses the `(1-p)^N` race at RT thread counts.
+leaves `N` calls to `synchronize_rcu_expedited()`, and `lru-isolate` can still lose the drain-versus-queue race.
+The desktop measurements do not establish a safe thread-count threshold.
 
 **Do not deploy this tool on a cpuset holding hundreds of threads and expect it
-to hold.** It is honest at `N` in the single digits. Above that, shrink `N` or
-fix the kernel.
+to hold.** Small `N` is not a guarantee either. Reduce migration triggers where possible
+and validate at the real workload and CPU count.
 
 ## What actually fixes this
 
@@ -308,14 +314,35 @@ upstream-supported configuration. It also fixes the `kthread_fetch_affinity()`
 regression (commit 041ee6f3727a) that lets unbound kworkers land on isolated
 CPUs and dirty their batches — i.e. it lowers `p` as well as helping cause 1.
 
-**4. Kernel patch #3 from the bug.** The only actual guarantee: a
-`lru_batching_disabled()` helper that stops isolated CPUs from batching at all,
-so `cpu_needs_drain()` can never be true and the race has no window.
+**4. A kernel fix for the queueing/starvation path.** The proposed batching
+patch is one candidate. Verify coverage of every `cpu_needs_drain()` term,
+including mlock and buffer-head state, against the exact deployed kernel;
+this userspace repository does not establish that patch's correctness.
 
 **Where `lru-isolate` still earns its place:** `check` reports which boot
 parameters you are missing, and `lru-verify --decay` measures the real `p` on
 your hardware — the number that decides whether any of this is viable for you.
 Use it as instrumentation first and a mitigation second.
+
+### A delayed hang with the reproducer
+
+The bundled `repro_worker.c` repeatedly refaults 24 MiB and calls
+`MADV_DONTNEED` at FIFO priority 80. It continuously refills LRU batches;
+this differs from the pre-faulted busy loop in `rt-spinner`.
+
+A drain can prevent a later queueing decision, but it cannot complete an
+already queued `lru_add_drain_work`. Even if `madvise()` empties the batch,
+`flush_work()` still waits for that work item's callback. A higher-priority
+userspace drainer running briefly does not give a normal-priority kworker
+CPU time: when the drainer sleeps, the FIFO workload can resume immediately.
+Increasing drain frequency can delay the race without removing it.
+
+Capture whether drain passes continue through the hang and the blocked
+migration worker's stack. A stopped guard points to a scheduling or drain
+failure; continued passes with `flush_work()` under `__lru_add_drain_all()`
+point to queued work that still needs its kworker to run. A stack in
+`synchronize_rcu_expedited()` requires separate RCU investigation. Time to
+first hang alone cannot distinguish these cases.
 
 ### Residual: `has_bh_in_lru()`
 
@@ -368,7 +395,7 @@ cause 2  __lru_add_drain_all() flush stall  : EXPOSED
 
 Drains every isolated CPU, runs your command, and **keeps draining until the
 migration the command triggered has finished** — because that migration runs
-asynchronously, after the write returns (see [The write is not where the
+on a worker while the writer can wait for it (see [The write is not where the
 migration happens](#the-write-is-not-where-the-migration-happens)).
 
 ```bash
@@ -403,8 +430,7 @@ That default is chosen for coverage, not for your latency budget. Measure it
 with `-v` (it reports per-core dispatch and drain latency) and widen
 `--interval` until the jitter fits, accepting that a wider interval leaves more
 of the migration uncovered. The honest position is that this is a coverage/jitter
-dial with no free setting — the only configuration with neither cost is kernel
-patch #3 from the bug.
+dial with no free setting — a kernel fix would need separate correctness and latency validation.
 
 ### Operating model — how this holds up continually
 
@@ -447,10 +473,9 @@ migration workqueue goes idle. The point is not the gap before the write — it 
 that every one of the serialized `cpu_needs_drain()` reads the migration makes,
 across its whole duration, lands inside a covered interval.
 
-An earlier version of this tool drained once and `exec`ed, on the assumption
-that the write reached `do_migrate_pages()` synchronously. It does not, so the
-drain threads were gone before the first work item was picked up and `arm`
-did nothing at all.
+An earlier version of this tool drained once and `exec`ed, without covering later queueing decisions. The migration runs on a worker
+and the writer flushes that workqueue from task_work; a single pre-drain
+can reduce queueing initially but cannot cover the entire migration.
 
 #### 3. `guard` — insurance for writes you do not control
 
@@ -468,11 +493,9 @@ CPUs.
 
 Even armed, the window is nonzero, and it is nonzero once per thread in the
 cpuset — see [One migration per thread](#one-migration-per-thread-not-per-process).
-**This is a probabilistic mitigation whose odds decay geometrically with the
-thread count, not a guarantee.** The guarantee is kernel patch #3 from the bug — a
-`lru_batching_disabled()` helper that skips LRU batching on isolated CPUs
-entirely, so the batch can never become non-empty and the race has no window at
-all. This tool buys you the time until that ships.
+**This is a probabilistic mitigation; repeated migration attempts provide
+more opportunities to lose the race.** A kernel fix must cover all paths that can leave work queued to a starved
+CPU. The proposed batching patch requires separate validation.
 
 #### Measure it rather than trust the model
 
@@ -502,9 +525,23 @@ To preempt a `SCHED_FIFO/80` spinner the drain thread must run above it.
 `--rtprio auto` (default) scans **userspace** `SCHED_FIFO`/`RR` threads per CPU
 and picks the highest + 1; kernel threads are excluded, because `migration/N`
 and the per-CPU RCU kthreads sit at FIFO 99 on every CPU and would otherwise
-push every drain to 99 for no reason. It scans `/proc/<pid>/task/<tid>`, not
-just thread-group leaders — a busy-poll spinner is usually a thread inside a
-larger process.
+push every drain to 99 for no reason. It scans `/proc/<pid>/task/<tid>` and considers every CPU each RT task is
+allowed to use. It excludes its own threads when rescanning.
+
+If a drain thread has not responded after 100 ms, `auto` rescans and raises
+its priority above newly started RT tasks. Previously it scanned only at
+startup: starting the guard before the FIFO/80 reproducer left normal-priority
+drainers unable to run. Each controller wait fails after five seconds without
+completion and names the CPU. Permission failures now exit nonzero instead of
+falling back to normal scheduling. A userspace RT task at priority 99 leaves
+no higher FIFO priority and is reported as an error in auto mode.
+
+For a controlled test of the bundled FIFO/80 reproducer, start the guard with
+`--rtprio 81` before the load; this avoids the initial recovery delay. Keep the
+interval unchanged for the first comparison so only priority handling differs.
+This does not remove the race with kernel work queueing. If `arm` loses a drain
+after launching the command, it exits nonzero and reports the command PID;
+the command may still be running. A failed initial drain prevents launch.
 
 Use `--rtprio N` to pin it, or `--rtprio none` to stay `SCHED_OTHER` (which will
 not run at all on a saturated CPU). `--serial` staggers the drains one CPU at a
