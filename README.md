@@ -463,10 +463,20 @@ choices have to be made together.
 **The main loop pins itself to the complement of the target set**, so only the
 pinned drain threads ever execute on an isolated core.
 
-**Target CPUs are checked against the process's own affinity mask first.** A
-unit with `AllowedCPUs=`, or a `taskset` wrapper, silently removes the isolated
-cores and every `pthread_create()` would fail with a bare `EINVAL`. `check`
-reports this as a `reachable:` count and a named warning instead.
+**Target CPUs are checked against the process's own affinity mask first**, and
+the two ways they can go missing are not the same problem. `CPUAffinity=` — in
+the unit, in `/etc/systemd/system.conf`, or a `taskset` wrapper — is a plain
+`sched_setaffinity()` restriction, and a task can widen its own mask straight
+back out of it with no capability required; `lru-isolate` does exactly that and
+carries on. `AllowedCPUs=` is a cpuset, which is a hard ceiling it cannot
+escape, and that is reported as an error naming the unit and its parent slice.
+
+This matters on precisely the hosts the mitigation is for: a manager-wide
+`CPUAffinity=` in `system.conf` pinning services to housekeeping cores is
+standard low-latency tuning, it is inherited by every unit including
+`lru-isolate-guard`, and before this the guard unit would fail at startup with
+every target CPU unreachable — the isolation that makes the mitigation
+necessary was the same thing locking it out.
 
 Two costs are inherent and cannot be engineered away from userspace: the futex
 wake needs a rescheduling IPI to the isolated core, and on `nohz_full` that core

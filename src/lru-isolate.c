@@ -499,22 +499,65 @@ static int drainers_start(const char *mask, int rtprio_opt)
 	}
 
 	/*
-	 * Report a cpuset restriction as such.  A systemd unit with
-	 * AllowedCPUs=, or a taskset wrapper, silently removes the isolated
-	 * cores from our mask and every pthread_create() would just fail EINVAL.
+	 * Target CPUs missing from our affinity mask come from one of two
+	 * places, and only one of them is fatal:
+	 *
+	 *   CPUAffinity= (in the unit, in /etc/systemd/system.conf, or a
+	 *   taskset wrapper) is a plain sched_setaffinity() restriction.  It
+	 *   is not a ceiling - a task can widen its own mask straight back
+	 *   out of it, no capability required.  On a tuned low-latency host a
+	 *   manager-wide CPUAffinity= in system.conf is normal, and it is
+	 *   inherited by every unit including this one.
+	 *
+	 *   AllowedCPUs= is a cpuset, which IS a hard ceiling.
+	 *
+	 * Try to widen, then look again to see which one we are in.  Without
+	 * this, the guard unit on an isolated box fails at startup with every
+	 * target CPU unreachable - the isolation that makes the mitigation
+	 * necessary is the same thing that locked it out.
 	 */
-	for (int c = 0; c < g_ncpu; c++) {
-		if (mask[c] && !cpu_permitted(c, allowed)) {
-			fprintf(stderr,
-				"error: cpu%d is outside this process's affinity mask\n",
-				c);
+	for (int c = 0; c < g_ncpu; c++)
+		if (mask[c] && !cpu_permitted(c, allowed))
 			unreachable++;
+
+	if (unreachable) {
+		cpu_set_t *wide = CPU_ALLOC((size_t)g_ncpu);
+
+		if (wide) {
+			CPU_ZERO_S(g_setsz, wide);
+			for (int c = 0; c < g_ncpu; c++)
+				if (mask[c] || cpu_permitted(c, allowed))
+					CPU_SET_S((size_t)c, g_setsz, wide);
+
+			if (sched_setaffinity(0, g_setsz, wide) == 0 &&
+			    sched_getaffinity(0, g_setsz, allowed) == 0) {
+				int still = 0;
+
+				for (int c = 0; c < g_ncpu; c++)
+					if (mask[c] && !cpu_permitted(c, allowed))
+						still++;
+				if (!still)
+					vrb("widened affinity mask to reach %d "
+					    "target CPU(s) held off by a "
+					    "CPUAffinity=/taskset restriction\n",
+					    unreachable);
+				unreachable = still;
+			}
+			CPU_FREE(wide);
 		}
 	}
+
 	if (unreachable) {
+		for (int c = 0; c < g_ncpu; c++)
+			if (mask[c] && !cpu_permitted(c, allowed))
+				fprintf(stderr,
+					"error: cpu%d is outside this process's "
+					"affinity mask\n", c);
 		fprintf(stderr,
-			"       %d target CPU(s) unreachable - check the unit's "
-			"AllowedCPUs=/CPUAffinity= or any taskset wrapper.\n",
+			"       %d target CPU(s) unreachable, and widening the "
+			"mask did not help - so this is a cpuset ceiling, not a\n"
+			"       CPUAffinity= setting. Check AllowedCPUs= on this "
+			"unit and on its parent slice.\n",
 			unreachable);
 		CPU_FREE(allowed);
 		CPU_FREE(one);
