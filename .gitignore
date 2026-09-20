@@ -1,0 +1,6 @@
+# build artifacts (see Makefile BINS)
+/lru-isolate
+/lru-verify
+/premigrate
+/rt-spinner
+/lru-probe

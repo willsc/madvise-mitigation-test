@@ -1,0 +1,37 @@
+# Keeps the per-CPU LRU batches on isolated CPUs empty, so a cpuset.mems
+# write never queues drain work to a FIFO-saturated CPU.  Mitigation for
+# Ubuntu LP#2165410 (cause 2 only - see the README for cause 1).
+#
+# Tune --interval to your workload: the batches only refill when the isolated
+# CPU itself faults in pages, which a well-behaved pre-faulted RT thread does
+# not do, so a slow interval is usually enough.
+[Unit]
+Description=Keep isolated-CPU LRU batches drained (LP#2165410 mitigation)
+Documentation=https://bugs.launchpad.net/ubuntu/+source/linux-aws/+bug/2165410
+After=multi-user.target
+
+[Service]
+Type=simple
+# --rtprio auto raises the drain thread just above the highest SCHED_FIFO
+# priority seen on each target CPU, so it can preempt the busy-poll thread.
+ExecStart=/usr/local/bin/lru-isolate guard --interval 1000 --rtprio auto
+Restart=on-failure
+RestartSec=5
+# CAP_SYS_NICE : run the drain threads SCHED_FIFO above the busy-poll spinners
+# CAP_IPC_LOCK : mlockall(), which must succeed before the drain threads are
+#                created - otherwise their stacks fault in on the isolated core
+#                and dirty the batch we are there to drain (see README).
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Do NOT set AllowedCPUs= / CPUAffinity= to exclude the isolated cores: the
+# drain threads must be able to run on them. lru-isolate pins its own main loop
+# to the housekeeping complement, so it does not need help here. If a cpuset
+# does exclude them, `lru-isolate check' reports them as unreachable.
+
+[Install]
+WantedBy=multi-user.target
