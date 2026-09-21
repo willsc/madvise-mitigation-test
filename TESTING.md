@@ -45,7 +45,7 @@ drains, permission failures and timeouts. Then run the smoke test:
 
 ```bash
 ./lru-isolate --help
-./lru-isolate check          # on a box with no isolated CPUs: "not exposed"
+./lru-isolate check          # read-only RCU mode and isolated-CPU RT scan
 ```
 
 ## Stage 1 — mechanism, on any machine
@@ -191,10 +191,15 @@ sudo make install       # lru-isolate, lru-verify, premigrate + the unit
 **Both halves go in the same maintenance window**, because one of them is a
 boot parameter:
 
-1. Add `rcupdate.rcu_normal=1` to the kernel command line and reboot.
-   (Or switch to `isolcpus=domain,nohz,<list>`, which is upstream's supported
-   configuration and fixes cause 1 a different way.)
-2. Confirm with `lru-isolate check` — cause 1 should read `mitigated`.
+1. Add `rcupdate.rcu_normal=1` to the kernel command line and reboot; see the
+   [RCU procedure](README.md#mitigating-the-rcu-wait). This bypasses expedited
+   processing, but normal RCU can still block. A `domain` flag alone does not
+   verify worker scheduling and is not treated as an equivalent bypass.
+2. Confirm `/sys/module/rcupdate/parameters/rcu_normal` reads `1` and the updated
+   `lru-isolate check` reports `BYPASSED (normal grace periods)`. Its nonzero exit
+   status requests review if the RCU mode is unknown/enabled, RT tasks are
+   detected on the checked CPUs, or those CPUs are unreachable. A zero exit
+   status does not certify migration progress or inspect all workload CPUs.
 3. Deploy the cause-2 half, below.
 
 ### Which writes you can arm, and which you cannot

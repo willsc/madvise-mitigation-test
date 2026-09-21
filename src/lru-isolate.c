@@ -116,12 +116,12 @@
  * ----------------------
  * lru_cache_disable() calls synchronize_rcu_expedited() *before* the drain,
  * and do_migrate_pages() calls lru_cache_disable() unconditionally.  No
- * madvise() can avoid that.  Cause 1 needs one of:
- *   - rcupdate.rcu_normal=1        (boot param; module_param is 0444, so a
- *                                   reboot is required - not runtime writable)
- *   - isolcpus=domain,nohz,<list>  (upstream's supported configuration)
- *   - the kthread-affinity kernel patch from the bug
- * `lru-isolate check' reports which of these you are missing.
+ * madvise() can avoid that. rcupdate.rcu_normal=1 bypasses expedited
+ * processing at runtime (boot param; module_param is 0444). Normal RCU
+ * still requires runnable workers and completion of read-side sections.
+ * Alternatively, expedited workers need effective affinity to CPUs with
+ * available execution time. A domain flag alone does not prove progress.
+ * `lru-isolate check' reports the RCU mode, not a guarantee against stalls.
  */
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -1143,7 +1143,7 @@ static int cmd_check(void)
 {
 	char *mask = calloc((size_t)g_ncpu, 1);
 	char why[256], isolcpus[256], val[64];
-	int iso, dom, exposed1 = 0, exposed2 = 0, unreachable = 0;
+	int iso, dom, rcu_normal = -1, exposed2 = 0, unreachable = 0;
 	cpu_set_t *allowed;
 	struct utsname u;
 
@@ -1154,14 +1154,7 @@ static int cmd_check(void)
 	printf("cpus          : %d\n", g_ncpu);
 
 	iso = detect_isolated(mask, why, sizeof(why));
-	if (iso != 0) {
-		printf("isolated CPUs : none\n");
-		printf("\nVERDICT: not exposed. LP#2165410 needs nohz_full/isolated CPUs\n"
-		       "         occupied by SCHED_FIFO threads.\n");
-		free(mask);
-		return 0;
-	}
-	printf("isolated CPUs : %s\n", why);
+	printf("isolated CPUs : %s\n", iso == 0 ? why : "none detected");
 
 	dom = cmdline_has_isolcpus_domain(isolcpus, sizeof(isolcpus));
 	if (dom < 0)
@@ -1171,10 +1164,18 @@ static int cmd_check(void)
 		       dom ? "present" : "MISSING");
 
 	if (read_first_line("/sys/module/rcupdate/parameters/rcu_normal",
-			    val, sizeof(val)) == 0)
+			    val, sizeof(val)) == 0) {
+		char *end;
+		long setting;
+
 		printf("rcu_normal    : %s\n", val);
-	else
-		strcpy(val, "?");
+		errno = 0;
+		setting = strtol(val, &end, 10);
+		if (!errno && end != val && !*end)
+			rcu_normal = setting != 0;
+	} else {
+		printf("rcu_normal    : unknown (cannot read parameter)\n");
+	}
 
 	/* can we even reach the isolated cores from here? */
 	allowed = CPU_ALLOC((size_t)g_ncpu);
@@ -1190,8 +1191,6 @@ static int cmd_check(void)
 	printf("reachable     : %d of %d isolated CPU(s)\n",
 	       count_mask(mask) - unreachable, count_mask(mask));
 
-	if (strcmp(val, "1") != 0 && dom != 1)
-		exposed1 = 1;
 	{
 		int *rtmax = calloc((size_t)g_ncpu, sizeof(int));
 
@@ -1205,30 +1204,34 @@ static int cmd_check(void)
 	}
 
 	printf("\n");
-	printf("cause 1  synchronize_rcu_expedited() stall : %s\n",
-	       exposed1 ? "EXPOSED" : "mitigated");
-	if (exposed1)
-		printf("         fix: boot with rcupdate.rcu_normal=1 (the module_param\n"
-		       "              is 0444 - not runtime writable, reboot required),\n"
-		       "              or use isolcpus=domain,nohz,<list>.\n"
-		       "         lru-isolate CANNOT mitigate this one.\n");
+	printf("cause 1  expedited RCU processing         : %s\n",
+	       rcu_normal == 1 ? "BYPASSED (normal grace periods)" :
+	       rcu_normal == 0 ? "ENABLED (progress unverified)" : "UNKNOWN");
+	if (rcu_normal != 1)
+		printf("         bypass: boot with rcupdate.rcu_normal=1 (0444 parameter;\n"
+		       "                 not runtime writable, reboot required).\n"
+		       "         isolcpus=domain alone does not establish RCU progress.\n");
+	printf("         Normal RCU can also stall; worker scheduling and readers\n"
+	       "         still matter. The madvise drain does not complete RCU work.\n");
 	printf("cause 2  __lru_add_drain_all() flush stall  : %s\n",
-	       exposed2 ? "EXPOSED" : "mitigated");
+	       exposed2 ? "RT TASKS DETECTED" : "no RT tasks detected in checked CPU set");
 	if (exposed2)
 		printf("         %d isolated CPU(s) currently carry SCHED_FIFO/RR tasks.\n"
-		       "         fix: lru-isolate arm -- <your cpuset write>\n",
+		       "         lru-isolate reduces queueing opportunities only; already\n"
+		       "         queued work still needs its kernel worker to run.\n",
 		       exposed2);
+	printf("         This scan covers detected isolated CPUs, not all workload CPUs.\n");
 	if (unreachable)
 		printf("\nWARNING: %d isolated CPU(s) are outside this process's affinity\n"
 		       "         mask, so lru-isolate cannot drain them. Check the unit's\n"
 		       "         AllowedCPUs=/CPUAffinity= or any taskset wrapper.\n",
 		       unreachable);
 
-	printf("\nVERDICT: %s\n",
-	       (exposed1 || exposed2) ? "exposed - see above"
-				      : "both causes mitigated");
+	printf("\nVERDICT: %s; this is not a proof of migration progress.\n",
+	       (rcu_normal != 1 || exposed2 || unreachable) ? "review required - see above"
+				      : "expedited RCU bypassed; no RT tasks detected in checked CPU set");
 	free(mask);
-	return (exposed1 || exposed2) ? 1 : 0;
+	return (rcu_normal != 1 || exposed2 || unreachable) ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------- main */

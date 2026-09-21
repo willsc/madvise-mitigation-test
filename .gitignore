@@ -5,4 +5,5 @@
 /rt-spinner
 /lru-probe
 /tests/test-drainer
+/tests/test-check
 /tests/fail-madvise.so

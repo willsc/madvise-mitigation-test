@@ -11,7 +11,9 @@ it removes a CPU from the `__lru_add_drain_all()` flush set — but a
 `cpuset.mems` write queues one migration **per thread** in the cpuset, and each
 one makes another queueing decision that may encounter a dirty batch.
 More threads and continuously refaulting workloads increase exposure. The
-`synchronize_rcu_expedited()` blocking path needs separate mitigation.
+`synchronize_rcu_expedited()` blocking path needs separate mitigation:
+[`rcupdate.rcu_normal=1` at boot](#mitigating-the-rcu-wait) bypasses expedited
+processing, while retaining the required RCU grace period.
 
 **If you are here because your box still hangs, the useful fixes are in
 [What actually fixes this](#what-actually-fixes-this), not in this tool.** Read
@@ -264,9 +266,9 @@ dispatch.
 
 | | Cause 1 — `synchronize_rcu_expedited()` | Cause 2 — `__lru_add_drain_all()` |
 |---|---|---|
-| Blocks because | `rcu_exp_par_gp_kthread_worker/N` is pinned to a nohz_full CPU and starves behind the FIFO spinner | the per-CPU kworker never runs on a FIFO-saturated CPU, so `flush_work()` waits |
+| Can block because | an expedited RCU worker cannot run behind FIFO tasks, or a required quiescent state is delayed | the per-CPU kworker never runs on a FIFO-saturated CPU, so `flush_work()` waits |
 | Fixed by this tool | **No** | **No guarantee; reduces queueing opportunities** |
-| Fix without a kernel patch | `rcupdate.rcu_normal=1` **at boot**, or `isolcpus=domain,nohz,<list>` | `lru-isolate` |
+| Mitigation without a kernel patch | `rcupdate.rcu_normal=1` **at boot** bypasses expedited processing; normal RCU must still progress | `lru-isolate` reduces queueing opportunities only |
 
 `do_migrate_pages()` calls `lru_cache_disable()` unconditionally, and
 `lru_cache_disable()` calls `synchronize_rcu_expedited()` before the drain. No
@@ -278,10 +280,59 @@ of a mitigation, not the whole thing.**
 0444)`, confirmed by `-r--r--r--` on `/sys/module/rcupdate/parameters/rcu_normal`.
 It requires a reboot.
 
-**Partial no-patch mitigation** = boot with `rcupdate.rcu_normal=1` (kills
-cause 1) **+** keep `N` small (see below) **+** run `lru-isolate` (makes cause 2
-unlikely per migration, not impossible). `lru-isolate check` tells you which
-boot parameters you are missing.
+**Candidate no-patch combination** = boot with `rcupdate.rcu_normal=1`
+**+** keep `N` small (see below) **+** run `lru-isolate`. This bypasses expedited
+RCU workers and reduces LRU queueing opportunities, but still requires testing
+for normal RCU and LRU-worker progress. `lru-isolate check` reports the RCU mode
+and detected RT tasks; it cannot certify that the machine will not hang.
+
+### Mitigating the RCU wait
+
+The supplied `7.0.0-1008-aws` boot log has `isolcpus=domain,managed_irq,5-30`
+and `nohz_full=5-30`, but no `rcupdate.rcu_normal=1`. The presence of `domain`
+does not by itself establish that all RCU workers have execution time.
+
+On the affected Ubuntu host, before another test:
+
+1. Add `rcupdate.rcu_normal=1` to the existing `GRUB_CMDLINE_LINUX_DEFAULT`
+   value in `/etc/default/grub`, preserving its other parameters.
+2. Run `sudo update-grub`, then reboot during the test maintenance window.
+3. Before starting any FIFO workload, confirm:
+
+   ```bash
+   cat /sys/module/rcupdate/parameters/rcu_normal
+   lru-isolate check
+   ```
+
+   The parameter must read `1`; the updated checker reports expedited RCU
+   processing as `BYPASSED (normal grace periods)`.
+
+In the locally inspected Ubuntu 7.0 source (1012, a different build from the
+captured 1008 host), `synchronize_rcu_expedited()` checks `rcu_gp_is_normal()`
+and calls `synchronize_rcu_normal()` before queueing expedited work. The
+required synchronization remains intact. This is a system-wide RCU policy
+change and can increase grace-period latency; it is not a timeout or a skipped
+wait. See the [kernel parameter documentation](https://docs.kernel.org/admin-guide/kernel-parameters.html).
+
+If expedited grace periods must remain enabled, the worker-starvation fix is
+to give the main and parallel expedited workers effective affinity to CPUs
+reserved for kernel work, with a valid fallback when a preferred group has
+no such online CPU. CPU hotplug and affinity updates must preserve that rule.
+Confirm actual worker affinity against the actual FIFO workload CPU set;
+`rcu_nocbs` offloads callbacks and is not proof of expedited-worker placement.
+The neighboring repository's affinity patch is experimental and targets 1012,
+so it is not a verified fix for the captured 1008 kernel.
+
+Do not assume `rcutree.kthread_prio=81` alone fixes FIFO-80 starvation. In the
+inspected source, expedited workers receive that FIFO priority only under
+`CONFIG_RCU_EXP_KTHREAD`. Ordinary RCU priority settings and the madvise
+drainer's priority do not establish expedited-worker progress.
+
+Normal RCU also needs its workers and readers to make progress. Keep actual
+FIFO workers off the CPUs reserved for kernel work, and arm the capture before
+the test as described in [TESTING.md](TESTING.md#start-automatic-capture-before-triggering-the-hang).
+Review saved stacks after recovery. The supplied ENA watchdog timeout alone
+does not identify an RCU blocking stack or demonstrate that this bypass works.
 
 ### The third axis: `N`
 
@@ -305,14 +356,14 @@ RT daemon starts. An empty cpuset has nothing to migrate and the stall has no
 fuel. If something in your tooling retunes NUMA on a running slice, removing
 that is worth more than everything else on this page.
 
-**2. Boot with `rcupdate.rcu_normal=1`.** Required for cause 1 regardless of
-anything else, and `N` expedited grace periods is exactly the workload it
-protects against. Not runtime-writable — `module_param(rcu_normal, int, 0444)`.
+**2. Consider `rcupdate.rcu_normal=1`.** This bypasses expedited RCU processing;
+it is an alternative to repairing expedited-worker scheduling, not a cure for
+all RCU stalls. See [Mitigating the RCU wait](#mitigating-the-rcu-wait).
 
-**3. Add the `domain` flag: `isolcpus=domain,nohz,<list>`.** The
-upstream-supported configuration. It also fixes the `kthread_fetch_affinity()`
-regression (commit 041ee6f3727a) that lets unbound kworkers land on isolated
-CPUs and dirty their batches — i.e. it lowers `p` as well as helping cause 1.
+**3. Verify worker placement and CPU availability.** The `domain` flag helps
+exclude isolated CPUs from unbound kernel-thread affinity. Your supplied boot
+log already has this flag. It cannot prevent starvation on housekeeping CPUs
+also occupied by FIFO workloads; inspect effective worker and workload masks.
 
 **4. A kernel fix for the queueing/starvation path.** The proposed batching
 patch is one candidate. Verify coverage of every `cpu_needs_drain()` term,
@@ -388,14 +439,16 @@ isolated CPUs : nohz_full=18-95,108-178, isolated=18-95,108-178
 isolcpus      : nohz,18-95,108-178  [domain flag: MISSING]
 rcu_normal    : 0
 
-cause 1  synchronize_rcu_expedited() stall : EXPOSED
-         fix: boot with rcupdate.rcu_normal=1 (the module_param
-              is 0444 - not runtime writable, reboot required),
-              or use isolcpus=domain,nohz,<list>.
-         lru-isolate CANNOT mitigate this one.
-cause 2  __lru_add_drain_all() flush stall  : EXPOSED
-         148 isolated CPU(s) currently carry SCHED_FIFO/RR tasks.
-         fix: lru-isolate arm -- <your cpuset write>
+cause 1  expedited RCU processing         : ENABLED (progress unverified)
+         bypass: boot with rcupdate.rcu_normal=1 (0444 parameter;
+                 not runtime writable, reboot required).
+         isolcpus=domain alone does not establish RCU progress.
+         Normal RCU can also stall; worker scheduling and readers
+         still matter. The madvise drain does not complete RCU work.
+cause 2  __lru_add_drain_all() flush stall  : RT TASKS DETECTED
+         149 isolated CPU(s) currently carry SCHED_FIFO/RR tasks.
+         lru-isolate reduces queueing opportunities only; already
+         queued work still needs its kernel worker to run.
 ```
 
 ### Arm a cpuset write (the main use)

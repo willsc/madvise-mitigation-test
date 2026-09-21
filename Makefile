@@ -31,12 +31,16 @@ verify: lru-verify
 	./lru-verify
 
 # Controller regression tests: no FIFO spinners, NUMA changes or tracing.
-test: lru-isolate tests/test-drainer tests/fail-madvise.so
+test: lru-isolate tests/test-drainer tests/test-check tests/fail-madvise.so
 	./tests/test-drainer
+	./tests/test-check
 	python3 tests/test-cli.py ./lru-isolate ./tests/fail-madvise.so
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/test-capture.py
 
 tests/test-drainer: tests/test-drainer.c src/lru-isolate.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS_PTHREAD)
+
+tests/test-check: tests/test-check.c src/lru-isolate.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS_PTHREAD)
 
 tests/fail-madvise.so: tests/fail-madvise.c
@@ -62,6 +66,6 @@ uninstall:
 
 clean:
 	rm -f $(BINS) lru-probe
-	rm -f tests/test-drainer tests/fail-madvise.so
+	rm -f tests/test-drainer tests/test-check tests/fail-madvise.so
 
 .PHONY: all check verify test decay install uninstall clean
